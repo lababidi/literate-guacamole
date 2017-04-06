@@ -1,12 +1,11 @@
 from __future__ import print_function
 import tensorflow as tf
 import numpy as np
+from scipy import misc as misc
 
-import TensorflowUtils as utils
-import read_MITSceneParsingData as scene_parsing
+import tf_utils as utils
+import read_data as scene_parsing
 import datetime
-import BatchDatsetReader as dataset
-from six.moves import xrange
 
 FLAGS = tf.flags.FLAGS
 tf.flags.DEFINE_integer("batch_size", "2", "batch size for training")
@@ -20,8 +19,88 @@ tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
 
 MAX_ITERATION = int(1e5 + 1)
-NUM_OF_CLASSESS = 151
-IMAGE_SIZE = 224
+NUM_OF_CLASSES = 151
+IMAGE_SIZE = 1000
+
+
+class BatchDataset:
+    files = []
+    images = []
+    annotations = []
+    image_options = {}
+    batch_offset = 0
+    epochs_completed = 0
+
+    def __init__(self, records_list, image_options=None):
+        """
+        Initialize a generic file reader with batching for list of files
+        :param records_list: list of file records to read -
+        sample record: {'image': f, 'annotation': annotation_file, 'filename': filename}
+        :param image_options: A dictionary of options for modifying the output image
+        Available options:
+        resize = True/ False
+        resize_size = #size of output image - does bilinear resize
+        color=True/False
+        """
+        if image_options is None:
+            image_options = {}
+        print("Initializing Batch Dataset Reader...")
+        print(image_options)
+        self.files = records_list
+        self.image_options = image_options
+        self._read_images()
+
+    def _read_images(self):
+        self.__channels = True
+        self.images = np.array([self._transform(record['image']) for record in self.files])
+        self.__channels = False
+        self.annotations = np.array(
+            [np.expand_dims(self._transform(record['annotation']), axis=3) for record in self.files])
+        print(self.images.shape)
+        print(self.annotations.shape)
+
+    def _transform(self, image_file):
+        image = misc.imread(image_file)
+        if self.__channels and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
+            image = np.array([image] * 3)
+
+        if self.image_options.get("resize", False) and self.image_options["resize"]:
+            resize_size = int(self.image_options["resize_size"])
+            resize_image = misc.imresize(image,
+                                         [resize_size, resize_size], interp='nearest')
+        else:
+            resize_image = image
+
+        return np.array(resize_image)
+
+    def get_records(self):
+        return self.images, self.annotations
+
+    def reset_batch_offset(self, offset=0):
+        self.batch_offset = offset
+
+    def next_batch(self, batch_size):
+        start = self.batch_offset
+        self.batch_offset += batch_size
+        if self.batch_offset > self.images.shape[0]:
+            # Finished epoch
+            self.epochs_completed += 1
+            print("****************** Epochs completed: " + str(self.epochs_completed) + "******************")
+            # Shuffle the data
+            perm = np.arange(self.images.shape[0])
+            np.random.shuffle(perm)
+            self.images = self.images[perm]
+            self.annotations = self.annotations[perm]
+            # Start next epoch
+            start = 0
+            self.batch_offset = batch_size
+
+        end = self.batch_offset
+        return self.images[start:end], self.annotations[start:end]
+
+    def get_random_batch(self, batch_size):
+        indexes = np.random.randint(0, self.images.shape[0], size=[batch_size]).tolist()
+        return self.images[indexes], self.annotations[indexes]
 
 
 def vgg_net(weights, image):
@@ -46,7 +125,7 @@ def vgg_net(weights, image):
         kind = name[:4]
         if kind == 'conv':
             kernels, bias = weights[i][0][0][0][0]
-            # matconvnet: weights are [width, height, in_channels, out_channels]
+            # mat-convnet: weights are [width, height, in_channels, out_channels]
             # tensorflow: weights are [height, width, in_channels, out_channels]
             kernels = utils.get_variable(np.transpose(kernels, (1, 0, 2, 3)), name=name + "_w")
             bias = utils.get_variable(bias.reshape(-1), name=name + "_b")
@@ -85,45 +164,45 @@ def inference(image, keep_prob):
 
         pool5 = utils.max_pool_2x2(conv_final_layer)
 
-        W6 = utils.weight_variable([7, 7, 512, 4096], name="W6")
+        w6 = utils.weight_variable([7, 7, 512, 4096], name="W6")
         b6 = utils.bias_variable([4096], name="b6")
-        conv6 = utils.conv2d_basic(pool5, W6, b6)
+        conv6 = utils.conv2d_basic(pool5, w6, b6)
         relu6 = tf.nn.relu(conv6, name="relu6")
         if FLAGS.debug:
             utils.add_activation_summary(relu6)
         relu_dropout6 = tf.nn.dropout(relu6, keep_prob=keep_prob)
 
-        W7 = utils.weight_variable([1, 1, 4096, 4096], name="W7")
+        w7 = utils.weight_variable([1, 1, 4096, 4096], name="W7")
         b7 = utils.bias_variable([4096], name="b7")
-        conv7 = utils.conv2d_basic(relu_dropout6, W7, b7)
+        conv7 = utils.conv2d_basic(relu_dropout6, w7, b7)
         relu7 = tf.nn.relu(conv7, name="relu7")
         if FLAGS.debug:
             utils.add_activation_summary(relu7)
         relu_dropout7 = tf.nn.dropout(relu7, keep_prob=keep_prob)
 
-        W8 = utils.weight_variable([1, 1, 4096, NUM_OF_CLASSESS], name="W8")
-        b8 = utils.bias_variable([NUM_OF_CLASSESS], name="b8")
-        conv8 = utils.conv2d_basic(relu_dropout7, W8, b8)
+        w8 = utils.weight_variable([1, 1, 4096, NUM_OF_CLASSES], name="W8")
+        b8 = utils.bias_variable([NUM_OF_CLASSES], name="b8")
+        conv8 = utils.conv2d_basic(relu_dropout7, w8, b8)
         # annotation_pred1 = tf.argmax(conv8, dimension=3, name="prediction1")
 
         # now to upscale to actual image size
         deconv_shape1 = image_net["pool4"].get_shape()
-        W_t1 = utils.weight_variable([4, 4, deconv_shape1[3].value, NUM_OF_CLASSESS], name="W_t1")
+        w_t1 = utils.weight_variable([4, 4, deconv_shape1[3].value, NUM_OF_CLASSES], name="W_t1")
         b_t1 = utils.bias_variable([deconv_shape1[3].value], name="b_t1")
-        conv_t1 = utils.conv2d_transpose_strided(conv8, W_t1, b_t1, output_shape=tf.shape(image_net["pool4"]))
+        conv_t1 = utils.conv2d_transpose_strided(conv8, w_t1, b_t1, output_shape=tf.shape(image_net["pool4"]))
         fuse_1 = tf.add(conv_t1, image_net["pool4"], name="fuse_1")
 
         deconv_shape2 = image_net["pool3"].get_shape()
-        W_t2 = utils.weight_variable([4, 4, deconv_shape2[3].value, deconv_shape1[3].value], name="W_t2")
+        w_t2 = utils.weight_variable([4, 4, deconv_shape2[3].value, deconv_shape1[3].value], name="W_t2")
         b_t2 = utils.bias_variable([deconv_shape2[3].value], name="b_t2")
-        conv_t2 = utils.conv2d_transpose_strided(fuse_1, W_t2, b_t2, output_shape=tf.shape(image_net["pool3"]))
+        conv_t2 = utils.conv2d_transpose_strided(fuse_1, w_t2, b_t2, output_shape=tf.shape(image_net["pool3"]))
         fuse_2 = tf.add(conv_t2, image_net["pool3"], name="fuse_2")
 
         shape = tf.shape(image)
-        deconv_shape3 = tf.stack([shape[0], shape[1], shape[2], NUM_OF_CLASSESS])
-        W_t3 = utils.weight_variable([16, 16, NUM_OF_CLASSESS, deconv_shape2[3].value], name="W_t3")
-        b_t3 = utils.bias_variable([NUM_OF_CLASSESS], name="b_t3")
-        conv_t3 = utils.conv2d_transpose_strided(fuse_2, W_t3, b_t3, output_shape=deconv_shape3, stride=8)
+        deconv_shape3 = tf.stack([shape[0], shape[1], shape[2], NUM_OF_CLASSES])
+        w_t3 = utils.weight_variable([16, 16, NUM_OF_CLASSES, deconv_shape2[3].value], name="W_t3")
+        b_t3 = utils.bias_variable([NUM_OF_CLASSES], name="b_t3")
+        conv_t3 = utils.conv2d_transpose_strided(fuse_2, w_t3, b_t3, output_shape=deconv_shape3, stride=8)
 
         annotation_pred = tf.argmax(conv_t3, dimension=3, name="prediction")
 
@@ -141,7 +220,13 @@ def train(loss_val, var_list):
 
 
 def main(argv=None):
-    keep_probability = tf.placeholder(tf.float32, name="keep_probabilty")
+
+    print("Setting up image reader...")
+    train_records, valid_records = scene_parsing.read_dataset(FLAGS.data_dir)
+    print(len(train_records))
+    print(len(valid_records))
+
+    keep_probability = tf.placeholder(tf.float32, name="keep_probability")
     image = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 3], name="input_image")
     annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
 
@@ -149,9 +234,9 @@ def main(argv=None):
     tf.summary.image("input_image", image, max_outputs=2)
     tf.summary.image("ground_truth", tf.cast(annotation, tf.uint8), max_outputs=2)
     tf.summary.image("pred_annotation", tf.cast(pred_annotation, tf.uint8), max_outputs=2)
-    loss = tf.reduce_mean((tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,
-                                                                          labels=tf.squeeze(annotation, squeeze_dims=[3]),
-                                                                          name="entropy")))
+    loss = tf.reduce_mean((
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=logits, labels=tf.squeeze(annotation, squeeze_dims=[3]), name="entropy")))
     tf.summary.scalar("entropy", loss)
 
     trainable_var = tf.trainable_variables()
@@ -163,16 +248,9 @@ def main(argv=None):
     print("Setting up summary op...")
     summary_op = tf.summary.merge_all()
 
-    print("Setting up image reader...")
-    train_records, valid_records = scene_parsing.read_dataset(FLAGS.data_dir)
-    print(len(train_records))
-    print(len(valid_records))
-
     print("Setting up dataset reader")
     image_options = {'resize': True, 'resize_size': IMAGE_SIZE}
-    if FLAGS.mode == 'train':
-        train_dataset_reader = dataset.BatchDatset(train_records, image_options)
-    validation_dataset_reader = dataset.BatchDatset(valid_records, image_options)
+    validation_dataset_reader = BatchDataset(valid_records, image_options)
 
     sess = tf.Session()
 
@@ -187,7 +265,8 @@ def main(argv=None):
         print("Model restored...")
 
     if FLAGS.mode == "train":
-        for itr in xrange(MAX_ITERATION):
+        train_dataset_reader = BatchDataset(train_records, image_options)
+        for itr in range(MAX_ITERATION):
             train_images, train_annotations = train_dataset_reader.next_batch(FLAGS.batch_size)
             feed_dict = {image: train_images, annotation: train_annotations, keep_probability: 0.85}
 
@@ -213,9 +292,9 @@ def main(argv=None):
         pred = np.squeeze(pred, axis=3)
 
         for itr in range(FLAGS.batch_size):
-            utils.save_image(valid_images[itr].astype(np.uint8), FLAGS.logs_dir, name="inp_" + str(5+itr))
-            utils.save_image(valid_annotations[itr].astype(np.uint8), FLAGS.logs_dir, name="gt_" + str(5+itr))
-            utils.save_image(pred[itr].astype(np.uint8), FLAGS.logs_dir, name="pred_" + str(5+itr))
+            utils.save_image(valid_images[itr].astype(np.uint8), FLAGS.logs_dir, name="inp_" + str(5 + itr))
+            utils.save_image(valid_annotations[itr].astype(np.uint8), FLAGS.logs_dir, name="gt_" + str(5 + itr))
+            utils.save_image(pred[itr].astype(np.uint8), FLAGS.logs_dir, name="pred_" + str(5 + itr))
             print("Saved image: %d" % itr)
 
 

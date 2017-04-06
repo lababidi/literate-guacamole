@@ -1,13 +1,12 @@
-__author__ = 'Charlie'
-# Utils used with tensorflow implemetation
-import tensorflow as tf
-import numpy as np
-import scipy.misc as misc
-import os, sys
-from six.moves import urllib
+import os
+import sys
 import tarfile
 import zipfile
+
+import requests
 import scipy.io
+import scipy.misc as misc
+import tensorflow as tf
 
 
 def get_model_data(dir_path, model_url):
@@ -27,11 +26,20 @@ def maybe_download_and_extract(dir_path, url_name, is_tarfile=False, is_zipfile=
     filepath = os.path.join(dir_path, filename)
     if not os.path.exists(filepath):
         def _progress(count, block_size, total_size):
-            sys.stdout.write(
-                '\r>> Downloading %s %.1f%%' % (filename, float(count * block_size) / float(total_size) * 100.0))
+            sys.stdout.write('\r>> Downloading %s %.1f%%' % (filename, count * block_size / float(total_size) * 100.0))
             sys.stdout.flush()
 
-        filepath, _ = urllib.request.urlretrieve(url_name, filepath, reporthook=_progress)
+        # filepath, _ = urllib.request.urlretrieve(url_name, filepath, reporthook=_progress)
+
+        r = requests.get(url_name, stream=True)
+        lengths_dl = 0
+        with open(filepath, 'wb') as f:
+            total_length = int(r.headers.get('content-length'))
+            for chunk in r.iter_content(chunk_size=1024):  # , expected_size=(total_length / 1024) + 1):
+                if chunk:
+                    f.write(chunk)
+                    lengths_dl += 1
+                    _progress(lengths_dl, 1024, total_length)
         print()
         statinfo = os.stat(filepath)
         print('Succesfully downloaded', filename, statinfo.st_size, 'bytes.')
@@ -39,7 +47,7 @@ def maybe_download_and_extract(dir_path, url_name, is_tarfile=False, is_zipfile=
             tarfile.open(filepath, 'r:gz').extractall(dir_path)
         elif is_zipfile:
             with zipfile.ZipFile(filepath) as zf:
-                zip_dir = zf.namelist()[0]
+                # zip_dir = zf.namelist()[0]
                 zf.extractall(dir_path)
 
 
@@ -81,8 +89,10 @@ def bias_variable(shape, name=None):
 
 
 def get_tensor_size(tensor):
-    from operator import mul
-    return reduce(mul, (d.value for d in tensor.get_shape()), 1)
+    res = 1
+    for d in tensor.get_shape():
+        res *= d.value
+    return res
 
 
 def conv2d_basic(x, W, bias):
