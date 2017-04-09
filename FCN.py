@@ -1,11 +1,17 @@
 from __future__ import print_function
-import tensorflow as tf
-import numpy as np
-from scipy import misc as misc
 
-import tf_utils as utils
-import read_data as scene_parsing
 import datetime
+import os
+import pickle
+import random
+from glob import glob
+
+import numpy as np
+import tensorflow as tf
+from scipy import misc as misc
+from tensorflow.python.platform import gfile
+
+import utils as utils
 
 FLAGS = tf.flags.FLAGS
 tf.flags.DEFINE_integer("batch_size", "2", "batch size for training")
@@ -16,11 +22,67 @@ tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
 tf.flags.DEFINE_bool('debug', "False", "Debug mode: True/ False")
 tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
 
+DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
 
 MAX_ITERATION = int(1e5 + 1)
 NUM_OF_CLASSES = 151
 IMAGE_SIZE = 1000
+
+ANNOTATIONS = 'masks'  # "annotations"
+IMAGES = "images"
+
+
+def read_dataset(data_dir, download=False):
+    pickle_filename = "MITSceneParsing.pickle"
+    pickle_filepath = os.path.join(data_dir, pickle_filename)
+    if not os.path.exists(pickle_filepath):
+        if download:
+            utils.maybe_download_and_extract(data_dir, DATA_URL, is_zipfile=True)
+            scene_parsing_folder = os.path.splitext(DATA_URL.split("/")[-1])[0]
+            data_dir = os.path.join(data_dir, scene_parsing_folder)
+        result = create_image_lists(data_dir)
+        print("Pickling ...")
+        with open(pickle_filepath, 'wb') as f:
+            pickle.dump(result, f, pickle.HIGHEST_PROTOCOL)
+    else:
+        print("Found pickle file!")
+
+    with open(pickle_filepath, 'rb') as f:
+        result = pickle.load(f)
+        training_records = result['training']
+        validation_records = result['validation']
+        del result
+
+    return training_records, validation_records
+
+
+def create_image_lists(image_dir):
+    if not gfile.Exists(image_dir):
+        print("Image directory '" + image_dir + "' not found.")
+        return None
+    # directories = ['training', 'validation']
+    image_list = {'training': [], 'validation': []}
+
+    for directory in image_list:
+        file_list = glob(os.path.join(image_dir, directory, IMAGES, '*.png'))
+
+        if not file_list:
+            print('No files found')
+        else:
+            for f in file_list:
+                filename = os.path.splitext(f.split("/")[-1])[0]
+                annotation_file = os.path.join(image_dir, directory, ANNOTATIONS, filename + '.png')
+                if os.path.exists(annotation_file):
+                    record = {'image': f, 'annotation': annotation_file, 'filename': filename}
+                    image_list[directory].append(record)
+                else:
+                    print("Annotation file not found for %s - Skipping" % filename)
+
+        random.shuffle(image_list[directory])
+        print('No. of %s files: %d' % (directory, (len(image_list[directory]))))
+
+    return image_list
 
 
 class BatchDataset:
@@ -63,6 +125,8 @@ class BatchDataset:
         image = misc.imread(image_file)
         if self.__channels and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
             image = np.array([image] * 3)
+        if not self.__channels:
+            image = np.dot(image[..., :3], [0.299, 0.587, 0.114])
 
         if self.image_options.get("resize", False) and self.image_options["resize"]:
             resize_size = int(self.image_options["resize_size"])
@@ -72,6 +136,9 @@ class BatchDataset:
             resize_image = image
 
         return np.array(resize_image)
+
+    def squeeze_rgb(self, image_file):
+        image = misc.imread(image_file)
 
     def get_records(self):
         return self.images, self.annotations
@@ -159,7 +226,7 @@ def inference(image, keep_prob):
     processed_image = utils.process_image(image, mean_pixel)
 
     with tf.variable_scope("inference"):
-        image_net = vgg_net(weights, processed_image)
+        image_net = vgg_net(weights, image - mean_pixel)
         conv_final_layer = image_net["conv5_3"]
 
         pool5 = utils.max_pool_2x2(conv_final_layer)
@@ -222,7 +289,7 @@ def train(loss_val, var_list):
 def main(argv=None):
 
     print("Setting up image reader...")
-    train_records, valid_records = scene_parsing.read_dataset(FLAGS.data_dir)
+    train_records, valid_records = read_dataset(FLAGS.data_dir)
     print(len(train_records))
     print(len(valid_records))
 
