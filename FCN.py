@@ -9,6 +9,7 @@ from glob import glob
 import numpy as np
 import tensorflow as tf
 from scipy import misc as misc
+from scipy.misc import imread
 from tensorflow.python.platform import gfile
 
 import utils as utils
@@ -32,36 +33,30 @@ IMAGE_SIZE = 1000
 ANNOTATIONS = 'masks'  # "annotations"
 IMAGES = "images"
 
+def download_ade_date(data_dir):
+    utils.maybe_download_and_extract(data_dir, DATA_URL, is_zipfile=True)
+    scene_parsing_folder = os.path.splitext(DATA_URL.split("/")[-1])[0]
+    return os.path.join(data_dir, scene_parsing_folder)
 
 def read_dataset(data_dir, download=False):
-    pickle_filename = "MITSceneParsing.pickle"
-    pickle_filepath = os.path.join(data_dir, pickle_filename)
-    if not os.path.exists(pickle_filepath):
+    pickle_filepath = os.path.join(data_dir, "dataset.pickle")
+
+    if os.path.exists(pickle_filepath):
+        with open(pickle_filepath, 'rb') as f:
+            result = pickle.load(f)
+            return result['training'], result['validation']
+    else:
         if download:
-            utils.maybe_download_and_extract(data_dir, DATA_URL, is_zipfile=True)
-            scene_parsing_folder = os.path.splitext(DATA_URL.split("/")[-1])[0]
-            data_dir = os.path.join(data_dir, scene_parsing_folder)
+            data_dir = download_ade_date(data_dir)
         result = create_image_lists(data_dir)
-        print("Pickling ...")
         with open(pickle_filepath, 'wb') as f:
             pickle.dump(result, f, pickle.HIGHEST_PROTOCOL)
-    else:
-        print("Found pickle file!")
-
-    with open(pickle_filepath, 'rb') as f:
-        result = pickle.load(f)
-        training_records = result['training']
-        validation_records = result['validation']
-        del result
-
-    return training_records, validation_records
-
+        return result['training'], result['validation']
 
 def create_image_lists(image_dir):
     if not gfile.Exists(image_dir):
         print("Image directory '" + image_dir + "' not found.")
         return None
-    # directories = ['training', 'validation']
     image_list = {'training': [], 'validation': []}
 
     for directory in image_list:
@@ -84,6 +79,10 @@ def create_image_lists(image_dir):
 
     return image_list
 
+class Record:
+    def __init__(self, image, annotation):
+        self.image = image
+        self.annotation = annotation
 
 class BatchDataset:
     files = []
@@ -93,58 +92,37 @@ class BatchDataset:
     batch_offset = 0
     epochs_completed = 0
 
-    def __init__(self, records_list, image_options=None):
+    def __init__(self, records_list, resize, size):
         """
         Initialize a generic file reader with batching for list of files
         :param records_list: list of file records to read -
         sample record: {'image': f, 'annotation': annotation_file, 'filename': filename}
-        :param image_options: A dictionary of options for modifying the output image
         Available options:
         resize = True/ False
         resize_size = #size of output image - does bilinear resize
         color=True/False
         """
-        if image_options is None:
-            image_options = {}
+        self.resize = resize
+        self.size = size
         print("Initializing Batch Dataset Reader...")
-        print(image_options)
-        self.files = records_list
-        self.image_options = image_options
-        self._read_images()
-
-    def _read_images(self):
-        self.__channels = True
-        self.images = np.array([self._transform(record['image']) for record in self.files])
-        self.__channels = False
+        self.images = np.array([self.transform(imread(record['image'])) for record in records_list])
         self.annotations = np.array(
-            [np.expand_dims(self._transform(record['annotation']), axis=3) for record in self.files])
+            [np.expand_dims(self.transform(imread(record['annotation']), True), axis=3) for record in records_list])
+        self.batch_offset = 0
         print(self.images.shape)
         print(self.annotations.shape)
 
-    def _transform(self, image_file):
-        image = misc.imread(image_file)
-        if self.__channels and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
+    def transform(self, image, mask=False):
+        if self.resize:
+            image = np.array(misc.imresize(image, [self.size, self.size], interp='nearest'))
+
+        if not mask and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
             image = np.array([image] * 3)
-        if not self.__channels:
+
+        if mask and image.shape[-1] == 3:
             image = np.dot(image[..., :3], [0.299, 0.587, 0.114])
 
-        if self.image_options.get("resize", False) and self.image_options["resize"]:
-            resize_size = int(self.image_options["resize_size"])
-            resize_image = misc.imresize(image,
-                                         [resize_size, resize_size], interp='nearest')
-        else:
-            resize_image = image
-
-        return np.array(resize_image)
-
-    def squeeze_rgb(self, image_file):
-        image = misc.imread(image_file)
-
-    def get_records(self):
-        return self.images, self.annotations
-
-    def reset_batch_offset(self, offset=0):
-        self.batch_offset = offset
+        return np.array(image)
 
     def next_batch(self, batch_size):
         start = self.batch_offset
@@ -223,8 +201,6 @@ def inference(image, keep_prob):
 
     weights = np.squeeze(model_data['layers'])
 
-    processed_image = utils.process_image(image, mean_pixel)
-
     with tf.variable_scope("inference"):
         image_net = vgg_net(weights, image - mean_pixel)
         conv_final_layer = image_net["conv5_3"]
@@ -276,7 +252,7 @@ def inference(image, keep_prob):
     return tf.expand_dims(annotation_pred, dim=3), conv_t3
 
 
-def train(loss_val, var_list):
+def train_optimization(loss_val, var_list):
     optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
     grads = optimizer.compute_gradients(loss_val, var_list=var_list)
     if FLAGS.debug:
@@ -294,11 +270,11 @@ def main(argv=None):
     print(len(valid_records))
 
     keep_probability = tf.placeholder(tf.float32, name="keep_probability")
-    image = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 3], name="input_image")
+    image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 3], name="input_image")
     annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
 
-    pred_annotation, logits = inference(image, keep_probability)
-    tf.summary.image("input_image", image, max_outputs=2)
+    pred_annotation, logits = inference(image_placeholder, keep_probability)
+    tf.summary.image("input_image", image_placeholder, max_outputs=2)
     tf.summary.image("ground_truth", tf.cast(annotation, tf.uint8), max_outputs=2)
     tf.summary.image("pred_annotation", tf.cast(pred_annotation, tf.uint8), max_outputs=2)
     loss = tf.reduce_mean((
@@ -310,14 +286,13 @@ def main(argv=None):
     if FLAGS.debug:
         for var in trainable_var:
             utils.add_to_regularization_and_summary(var)
-    train_op = train(loss, trainable_var)
+    train_optimizer = train_optimization(loss, trainable_var)
 
     print("Setting up summary op...")
     summary_op = tf.summary.merge_all()
 
     print("Setting up dataset reader")
-    image_options = {'resize': True, 'resize_size': IMAGE_SIZE}
-    validation_dataset_reader = BatchDataset(valid_records, image_options)
+    validation_dataset_reader = BatchDataset(valid_records, True, IMAGE_SIZE)
 
     sess = tf.Session()
 
@@ -332,28 +307,29 @@ def main(argv=None):
         print("Model restored...")
 
     if FLAGS.mode == "train":
-        train_dataset_reader = BatchDataset(train_records, image_options)
+        train_dataset_reader = BatchDataset(train_records,  True, IMAGE_SIZE)
         for itr in range(MAX_ITERATION):
             train_images, train_annotations = train_dataset_reader.next_batch(FLAGS.batch_size)
-            feed_dict = {image: train_images, annotation: train_annotations, keep_probability: 0.85}
+            feed_dict = {image_placeholder: train_images, annotation: train_annotations, keep_probability: 0.85}
 
-            sess.run(train_op, feed_dict=feed_dict)
+            sess.run(train_optimizer, feed_dict=feed_dict)
 
-            if itr % 10 == 0:
+            if itr % 1 == 0:
                 train_loss, summary_str = sess.run([loss, summary_op], feed_dict=feed_dict)
                 print("Step: %d, Train_loss:%g" % (itr, train_loss))
                 summary_writer.add_summary(summary_str, itr)
+                saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
-            if itr % 500 == 0:
+            if itr % 5 == 0:
                 valid_images, valid_annotations = validation_dataset_reader.next_batch(FLAGS.batch_size)
-                valid_loss = sess.run(loss, feed_dict={image: valid_images, annotation: valid_annotations,
+                valid_loss = sess.run(loss, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
                                                        keep_probability: 1.0})
                 print("%s ---> Validation_loss: %g" % (datetime.datetime.now(), valid_loss))
                 saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
     elif FLAGS.mode == "visualize":
         valid_images, valid_annotations = validation_dataset_reader.get_random_batch(FLAGS.batch_size)
-        pred = sess.run(pred_annotation, feed_dict={image: valid_images, annotation: valid_annotations,
+        pred = sess.run(pred_annotation, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
                                                     keep_probability: 1.0})
         valid_annotations = np.squeeze(valid_annotations, axis=3)
         pred = np.squeeze(pred, axis=3)
