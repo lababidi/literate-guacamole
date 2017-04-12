@@ -1,15 +1,14 @@
 from __future__ import print_function
 
 import datetime
-import os
 import pickle
 import random
 from glob import glob
 
 import numpy as np
 import tensorflow as tf
-from scipy import misc as misc
-from scipy.misc import imread
+from os.path import join, splitext, exists
+from scipy.misc import imread, imsave, imresize
 from tensorflow.python.platform import gfile
 
 import utils as utils
@@ -20,14 +19,14 @@ tf.flags.DEFINE_string("logs_dir", "logs/", "path to logs directory")
 tf.flags.DEFINE_string("data_dir", "Data_zoo/MIT_SceneParsing/", "path to dataset")
 tf.flags.DEFINE_float("learning_rate", "1e-4", "Learning rate for Adam Optimizer")
 tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
-tf.flags.DEFINE_bool('debug', "False", "Debug mode: True/ False")
+tf.flags.DEFINE_bool('debug', "True", "Debug mode: True/ False")
 tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
 
 DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
 
 MAX_ITERATION = int(1e5 + 1)
-NUM_OF_CLASSES = 151
+NUM_OF_CLASSES = 2
 IMAGE_SIZE = 1000
 
 ANNOTATIONS = 'masks'  # "annotations"
@@ -35,13 +34,13 @@ IMAGES = "images"
 
 def download_ade_date(data_dir):
     utils.maybe_download_and_extract(data_dir, DATA_URL, is_zipfile=True)
-    scene_parsing_folder = os.path.splitext(DATA_URL.split("/")[-1])[0]
-    return os.path.join(data_dir, scene_parsing_folder)
+    scene_parsing_folder = splitext(DATA_URL.split("/")[-1])[0]
+    return join(data_dir, scene_parsing_folder)
 
 def read_dataset(data_dir, download=False):
-    pickle_filepath = os.path.join(data_dir, "dataset.pickle")
+    pickle_filepath = join(data_dir, "dataset.pickle")
 
-    if os.path.exists(pickle_filepath):
+    if exists(pickle_filepath):
         with open(pickle_filepath, 'rb') as f:
             result = pickle.load(f)
             return result['training'], result['validation']
@@ -60,15 +59,15 @@ def create_image_lists(image_dir):
     image_list = {'training': [], 'validation': []}
 
     for directory in image_list:
-        file_list = glob(os.path.join(image_dir, directory, IMAGES, '*.png'))
+        file_list = glob(join(image_dir, directory, IMAGES, '*.png'))
 
         if not file_list:
             print('No files found')
         else:
             for f in file_list:
-                filename = os.path.splitext(f.split("/")[-1])[0]
-                annotation_file = os.path.join(image_dir, directory, ANNOTATIONS, filename + '.png')
-                if os.path.exists(annotation_file):
+                filename = splitext(f.split("/")[-1])[0]
+                annotation_file = join(image_dir, directory, ANNOTATIONS, filename + '.png')
+                if exists(annotation_file):
                     record = {'image': f, 'annotation': annotation_file, 'filename': filename}
                     image_list[directory].append(record)
                 else:
@@ -114,13 +113,14 @@ class BatchDataset:
 
     def transform(self, image, mask=False):
         if self.resize:
-            image = np.array(misc.imresize(image, [self.size, self.size], interp='nearest'))
+            image = np.array(imresize(image, [self.size, self.size], interp='nearest'))
 
         if not mask and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
             image = np.array([image] * 3)
 
         if mask and image.shape[-1] == 3:
-            image = np.dot(image[..., :3], [0.299, 0.587, 0.114])
+            # image = np.dot(image[..., :3], [0.299/128, 0.587/128, 0.114/128])
+            image = (image.sum(axis=-1) > 0).astype(np.int)
 
         return np.array(image)
 
@@ -263,6 +263,7 @@ def train_optimization(loss_val, var_list):
 
 
 def main(argv=None):
+    print(argv)
 
     print("Setting up image reader...")
     train_records, valid_records = read_dataset(FLAGS.data_dir)
@@ -335,9 +336,9 @@ def main(argv=None):
         pred = np.squeeze(pred, axis=3)
 
         for itr in range(FLAGS.batch_size):
-            utils.save_image(valid_images[itr].astype(np.uint8), FLAGS.logs_dir, name="inp_" + str(5 + itr))
-            utils.save_image(valid_annotations[itr].astype(np.uint8), FLAGS.logs_dir, name="gt_" + str(5 + itr))
-            utils.save_image(pred[itr].astype(np.uint8), FLAGS.logs_dir, name="pred_" + str(5 + itr))
+            imsave(join(FLAGS.logs_dir, "inp_{}.png".format(itr)), valid_images[itr].astype(np.uint8))
+            imsave(join(FLAGS.logs_dir, "gt_{}.png".format(itr)), valid_annotations[itr].astype(np.uint8))
+            imsave(join(FLAGS.logs_dir, "pred_{}.png".format(itr)), pred[itr].astype(np.uint8))
             print("Saved image: %d" % itr)
 
 
