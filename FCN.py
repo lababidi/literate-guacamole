@@ -3,15 +3,20 @@ from __future__ import print_function
 import datetime
 import pickle
 import random
+import sys
+import tarfile
+import zipfile
 from glob import glob
 
+import os
 import numpy as np
+import requests
+import scipy.io
 import tensorflow as tf
 from os.path import join, splitext, exists
 from scipy.misc import imread, imsave, imresize
 from tensorflow.python.platform import gfile
 
-import utils as utils
 
 FLAGS = tf.flags.FLAGS
 tf.flags.DEFINE_integer("batch_size", "2", "batch size for training")
@@ -21,6 +26,7 @@ tf.flags.DEFINE_float("learning_rate", "1e-4", "Learning rate for Adam Optimizer
 tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
 tf.flags.DEFINE_bool('debug', "True", "Debug mode: True/ False")
 tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
+tf.flags.DEFINE_integer('channels', "3", "number of channels in image")
 
 DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
@@ -28,16 +34,73 @@ MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydee
 MAX_ITERATION = int(1e5 + 1)
 NUM_OF_CLASSES = 2
 IMAGE_SIZE = 1000
+IMG_CHANNELS = FLAGS.channels
 
 ANNOTATIONS = 'masks'  # "annotations"
 IMAGES = "images"
 
+
+def gen_file_path(file_url, dir_path):
+    filename = file_url.split('/')[-1]
+    file_path = os.path.join(dir_path, filename)
+    return filename, file_path
+
+
+def extract(dir_path, file_path, ziptar=None):
+    if ziptar == "tar":
+        tarfile.open(file_path, 'r:gz').extractall(dir_path)
+    elif ziptar == "zip":
+        with zipfile.ZipFile(file_path) as zf:
+            zf.extractall(dir_path)
+
+
+def download(path, url):
+    r = requests.get(url, stream=True)
+    with open(path, 'wb') as f:
+        blocks, chunk_size = 0, 1024
+        total_length = int(r.headers.get('content-length'))
+        total_blocks = total_length / chunk_size
+        for chunk in r.iter_content(chunk_size):
+            if chunk:
+                f.write(chunk)
+                blocks += 1
+                sys.stdout.write('\r>> Downloading %.1f%%'.format(100.0 * blocks / total_blocks))
+                sys.stdout.flush()
+        return os.stat(path).st_size
+
+
+def ww(shape, stddev=0.02, name=None):
+    initial = tf.truncated_normal(shape, stddev=stddev)
+    if name is None:
+        return tf.Variable(initial)
+    else:
+        return tf.get_variable(name, initializer=initial)
+
+
+def bb(shape, name=None):
+    initial = tf.constant(0.0, shape=shape)
+    if name is None:
+        return tf.Variable(initial)
+    else:
+        return tf.get_variable(name, initializer=initial)
+
+
+def conv2d(x, w, bias):
+    return tf.nn.bias_add(tf.nn.conv2d(x, w, strides=[1, 1, 1, 1], padding="SAME"), bias)
+
 def download_ade_date(data_dir):
-    utils.maybe_download_and_extract(data_dir, DATA_URL, is_zipfile=True)
+
+    filename, file_path = gen_file_path(DATA_URL, data_dir)
+    if not exists(file_path):
+        os.makedirs(data_dir, exist_ok=True)
+        file_size = download(file_path, DATA_URL)
+        print('Successfully downloaded', filename, file_size, 'bytes.')
+        extract(data_dir, file_path, ziptar='zip')
+
     scene_parsing_folder = splitext(DATA_URL.split("/")[-1])[0]
     return join(data_dir, scene_parsing_folder)
 
-def read_dataset(data_dir, download=False):
+def read_dataset(data_dir, do_download=False):
     pickle_filepath = join(data_dir, "dataset.pickle")
 
     if exists(pickle_filepath):
@@ -45,7 +108,7 @@ def read_dataset(data_dir, download=False):
             result = pickle.load(f)
             return result['training'], result['validation']
     else:
-        if download:
+        if do_download:
             data_dir = download_ade_date(data_dir)
         result = create_image_lists(data_dir)
         with open(pickle_filepath, 'wb') as f:
@@ -116,9 +179,11 @@ class BatchDataset:
             image = np.array(imresize(image, [self.size, self.size], interp='nearest'))
 
         if not mask and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
-            image = np.array([image] * 3)
+            image = np.array([image] * IMG_CHANNELS)
+        elif not mask and image.shape[-1] < IMG_CHANNELS:  # make sure images are of shape(h,w,3)
+            image = np.dstack([image] * (1+IMG_CHANNELS//image.shape[-1]))[:, :, :IMG_CHANNELS]
 
-        if mask and image.shape[-1] == 3:
+        if mask and image.shape[-1] > 1:
             # image = np.dot(image[..., :3], [0.299/128, 0.587/128, 0.114/128])
             image = (image.sum(axis=-1) > 0).astype(np.int)
 
@@ -149,6 +214,13 @@ class BatchDataset:
 
 
 def vgg_net(weights, image):
+    print("VGGGG")
+
+    def extract_var(w, var_name, trainable=True):
+        return tf.get_variable(name=var_name,
+                               initializer=(tf.constant_initializer(w)),
+                               shape=w.shape,
+                               trainable=trainable)
     layers = (
         'conv1_1', 'relu1_1', 'conv1_2', 'relu1_2', 'pool1',
 
@@ -168,19 +240,31 @@ def vgg_net(weights, image):
     current = image
     for i, name in enumerate(layers):
         kind = name[:4]
-        if kind == 'conv':
+        if i == 0:
             kernels, bias = weights[i][0][0][0][0]
             # mat-convnet: weights are [width, height, in_channels, out_channels]
             # tensorflow: weights are [height, width, in_channels, out_channels]
-            kernels = utils.get_variable(np.transpose(kernels, (1, 0, 2, 3)), name=name + "_w")
-            bias = utils.get_variable(bias.reshape(-1), name=name + "_b")
-            current = utils.conv2d_basic(current, kernels, bias)
+            print("kernel", kernels.shape)
+            kernels = np.concatenate([kernels, kernels], axis=2)
+            print("kernel", kernels.shape)
+            kernels = extract_var(np.transpose(kernels, (1, 0, 2, 3)), var_name=name + "_w")
+            bias = extract_var(bias.reshape(-1), var_name=name + "_b")
+            current = conv2d(current, kernels, bias)
+        elif kind == 'conv':
+            kernels, bias = weights[i][0][0][0][0]
+            # mat-convnet: weights are [width, height, in_channels, out_channels]
+            # tensorflow: weights are [height, width, in_channels, out_channels]
+            kernels = extract_var(np.transpose(kernels, (1, 0, 2, 3)), var_name=name + "_w")
+            bias = extract_var(bias.reshape(-1), var_name=name + "_b")
+            current = conv2d(current, kernels, bias)
         elif kind == 'relu':
             current = tf.nn.relu(current, name=name)
             if FLAGS.debug:
-                utils.add_activation_summary(current)
+                # utils.add_activation_summary(current)
+                tf.summary.histogram(current.op.name + "/activation", current)
+                tf.summary.scalar(current.op.name + "/sparsity", tf.nn.zero_fraction(current))
         elif kind == 'pool':
-            current = utils.avg_pool_2x2(current)
+            current = tf.nn.avg_pool(current, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
         net[name] = current
 
     return net
@@ -194,10 +278,21 @@ def inference(image, keep_prob):
     :return:
     """
     print("setting up vgg initialized conv layers ...")
-    model_data = utils.get_model_data(FLAGS.model_dir, MODEL_URL)
+
+    filename, file_path = gen_file_path(MODEL_URL, FLAGS.model_dir)
+    if not exists(file_path):
+        os.makedirs(FLAGS.model_dir, exist_ok=True)
+        file_size = download(file_path, MODEL_URL)
+        print('Successfully downloaded', filename, file_size, 'bytes.')
+        extract(FLAGS.model_dir, file_path)
+
+    if not exists(file_path):
+        raise IOError("VGG Model not found!")
+    model_data = scipy.io.loadmat(file_path)
 
     mean = model_data['normalization'][0][0][0]
     mean_pixel = np.mean(mean, axis=(0, 1))
+    mean_pixel = np.concatenate([mean_pixel, mean_pixel])
 
     weights = np.squeeze(model_data['layers'])
 
@@ -205,47 +300,58 @@ def inference(image, keep_prob):
         image_net = vgg_net(weights, image - mean_pixel)
         conv_final_layer = image_net["conv5_3"]
 
-        pool5 = utils.max_pool_2x2(conv_final_layer)
+        pool5 = tf.nn.max_pool(conv_final_layer, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
 
-        w6 = utils.weight_variable([7, 7, 512, 4096], name="W6")
-        b6 = utils.bias_variable([4096], name="b6")
-        conv6 = utils.conv2d_basic(pool5, w6, b6)
+        w6 = ww([7, 7, 512, 4096], name="W6")
+        b6 = bb([4096], name="b6")
+        conv6 = conv2d(pool5, w6, b6)
         relu6 = tf.nn.relu(conv6, name="relu6")
         if FLAGS.debug:
-            utils.add_activation_summary(relu6)
+            # utils.add_activation_summary(relu6)
+            tf.summary.histogram(relu6.op.name + "/activation", relu6)
+            tf.summary.scalar(relu6.op.name + "/sparsity", tf.nn.zero_fraction(relu6))
         relu_dropout6 = tf.nn.dropout(relu6, keep_prob=keep_prob)
 
-        w7 = utils.weight_variable([1, 1, 4096, 4096], name="W7")
-        b7 = utils.bias_variable([4096], name="b7")
-        conv7 = utils.conv2d_basic(relu_dropout6, w7, b7)
+        w7 = ww([1, 1, 4096, 4096], name="W7")
+        b7 = bb([4096], name="b7")
+        conv7 = conv2d(relu_dropout6, w7, b7)
         relu7 = tf.nn.relu(conv7, name="relu7")
         if FLAGS.debug:
-            utils.add_activation_summary(relu7)
+            # utils.add_activation_summary(relu7)
+            tf.summary.histogram(relu7.op.name + "/activation", relu7)
+            tf.summary.scalar(relu7.op.name + "/sparsity", tf.nn.zero_fraction(relu7))
         relu_dropout7 = tf.nn.dropout(relu7, keep_prob=keep_prob)
 
-        w8 = utils.weight_variable([1, 1, 4096, NUM_OF_CLASSES], name="W8")
-        b8 = utils.bias_variable([NUM_OF_CLASSES], name="b8")
-        conv8 = utils.conv2d_basic(relu_dropout7, w8, b8)
+        w8 = ww([1, 1, 4096, NUM_OF_CLASSES], name="W8")
+        b8 = bb([NUM_OF_CLASSES], name="b8")
+        conv8 = conv2d(relu_dropout7, w8, b8)
         # annotation_pred1 = tf.argmax(conv8, dimension=3, name="prediction1")
 
         # now to upscale to actual image size
         deconv_shape1 = image_net["pool4"].get_shape()
-        w_t1 = utils.weight_variable([4, 4, deconv_shape1[3].value, NUM_OF_CLASSES], name="W_t1")
-        b_t1 = utils.bias_variable([deconv_shape1[3].value], name="b_t1")
-        conv_t1 = utils.conv2d_transpose_strided(conv8, w_t1, b_t1, output_shape=tf.shape(image_net["pool4"]))
+        w_t1 = ww([4, 4, deconv_shape1[3].value, NUM_OF_CLASSES], name="W_t1")
+        b_t1 = bb([deconv_shape1[3].value], name="b_t1")
+        conv_t1 = tf.nn.bias_add(
+            tf.nn.conv2d_transpose(conv8, w_t1, tf.shape(image_net["pool4"]),
+                                   strides=[1, 2, 2, 1], padding="SAME"),
+            b_t1)
+
         fuse_1 = tf.add(conv_t1, image_net["pool4"], name="fuse_1")
 
         deconv_shape2 = image_net["pool3"].get_shape()
-        w_t2 = utils.weight_variable([4, 4, deconv_shape2[3].value, deconv_shape1[3].value], name="W_t2")
-        b_t2 = utils.bias_variable([deconv_shape2[3].value], name="b_t2")
-        conv_t2 = utils.conv2d_transpose_strided(fuse_1, w_t2, b_t2, output_shape=tf.shape(image_net["pool3"]))
+        w_t2 = ww([4, 4, deconv_shape2[3].value, deconv_shape1[3].value], name="W_t2")
+        b_t2 = bb([deconv_shape2[3].value], name="b_t2")
+        conv_t2 = tf.nn.bias_add(
+            tf.nn.conv2d_transpose(fuse_1, w_t2, tf.shape(image_net["pool3"]), strides=[1, 2, 2, 1], padding="SAME"),
+            b_t2)
         fuse_2 = tf.add(conv_t2, image_net["pool3"], name="fuse_2")
 
         shape = tf.shape(image)
         deconv_shape3 = tf.stack([shape[0], shape[1], shape[2], NUM_OF_CLASSES])
-        w_t3 = utils.weight_variable([16, 16, NUM_OF_CLASSES, deconv_shape2[3].value], name="W_t3")
-        b_t3 = utils.bias_variable([NUM_OF_CLASSES], name="b_t3")
-        conv_t3 = utils.conv2d_transpose_strided(fuse_2, w_t3, b_t3, output_shape=deconv_shape3, stride=8)
+        w_t3 = ww([16, 16, NUM_OF_CLASSES, deconv_shape2[3].value], name="W_t3")
+        b_t3 = bb([NUM_OF_CLASSES], name="b_t3")
+        conv_t3 = tf.nn.bias_add(
+            tf.nn.conv2d_transpose(fuse_2, w_t3, deconv_shape3, strides=[1, 8, 8, 1], padding="SAME"), b_t3)
 
         annotation_pred = tf.argmax(conv_t3, dimension=3, name="prediction")
 
@@ -256,9 +362,9 @@ def train_optimization(loss_val, var_list):
     optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
     grads = optimizer.compute_gradients(loss_val, var_list=var_list)
     if FLAGS.debug:
-        # print(len(var_list))
         for grad, var in grads:
-            utils.add_gradient_summary(grad, var)
+            if grad is not None:
+                tf.summary.histogram(var.op.name + "/gradient", grad)
     return optimizer.apply_gradients(grads)
 
 
@@ -271,11 +377,11 @@ def main(argv=None):
     print(len(valid_records))
 
     keep_probability = tf.placeholder(tf.float32, name="keep_probability")
-    image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 3], name="input_image")
+    image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, IMG_CHANNELS], name="input_image")
     annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
 
     pred_annotation, logits = inference(image_placeholder, keep_probability)
-    tf.summary.image("input_image", image_placeholder, max_outputs=2)
+    # tf.summary.image("input_image", image_placeholder, max_outputs=2)
     tf.summary.image("ground_truth", tf.cast(annotation, tf.uint8), max_outputs=2)
     tf.summary.image("pred_annotation", tf.cast(pred_annotation, tf.uint8), max_outputs=2)
     loss = tf.reduce_mean((
@@ -286,14 +392,15 @@ def main(argv=None):
     trainable_var = tf.trainable_variables()
     if FLAGS.debug:
         for var in trainable_var:
-            utils.add_to_regularization_and_summary(var)
+            # utils.add_to_regularization_and_summary(var)
+            tf.summary.histogram(var.op.name, var)
+            tf.add_to_collection("reg_loss", tf.nn.l2_loss(var))
     train_optimizer = train_optimization(loss, trainable_var)
 
-    print("Setting up summary op...")
     summary_op = tf.summary.merge_all()
 
     print("Setting up dataset reader")
-    validation_dataset_reader = BatchDataset(valid_records, True, IMAGE_SIZE)
+    validation_dataset = BatchDataset(valid_records, True, IMAGE_SIZE)
 
     sess = tf.Session()
 
@@ -308,9 +415,9 @@ def main(argv=None):
         print("Model restored...")
 
     if FLAGS.mode == "train":
-        train_dataset_reader = BatchDataset(train_records,  True, IMAGE_SIZE)
+        train_dataset = BatchDataset(train_records,  True, IMAGE_SIZE)
         for itr in range(MAX_ITERATION):
-            train_images, train_annotations = train_dataset_reader.next_batch(FLAGS.batch_size)
+            train_images, train_annotations = train_dataset.next_batch(FLAGS.batch_size)
             feed_dict = {image_placeholder: train_images, annotation: train_annotations, keep_probability: 0.85}
 
             sess.run(train_optimizer, feed_dict=feed_dict)
@@ -322,14 +429,15 @@ def main(argv=None):
                 saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
             if itr % 5 == 0:
-                valid_images, valid_annotations = validation_dataset_reader.next_batch(FLAGS.batch_size)
-                valid_loss = sess.run(loss, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
+                valid_images, valid_annotations = validation_dataset.next_batch(FLAGS.batch_size)
+                valid_loss = sess.run(loss, feed_dict={image_placeholder: valid_images,
+                                                       annotation: valid_annotations,
                                                        keep_probability: 1.0})
                 print("%s ---> Validation_loss: %g" % (datetime.datetime.now(), valid_loss))
                 saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
     elif FLAGS.mode == "visualize":
-        valid_images, valid_annotations = validation_dataset_reader.get_random_batch(FLAGS.batch_size)
+        valid_images, valid_annotations = validation_dataset.get_random_batch(FLAGS.batch_size)
         pred = sess.run(pred_annotation, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
                                                     keep_probability: 1.0})
         valid_annotations = np.squeeze(valid_annotations, axis=3)
@@ -344,3 +452,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     tf.app.run()
+
