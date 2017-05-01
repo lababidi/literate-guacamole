@@ -32,7 +32,7 @@ MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydee
 
 MAX_ITERATION = int(1e5 + 1)
 NUM_OF_CLASSES = 2
-IMAGE_SIZE = 100
+IMAGE_SIZE = 300
 IMG_CHANNELS = FLAGS.channels
 
 ANNOTATIONS = 'masks'  # "annotations"
@@ -283,13 +283,25 @@ def vgg_net(weights, image, mean):
     for i, name in enumerate(layers):
         kind = name[:4]
         if i == 0:
-            kernels, bias = weights[i][0][0][0][0]
+            rgb_kernels, bias = weights[i][0][0][0][0]
             # mat-convnet: weights are [width, height, in_channels, out_channels]
             # tensorflow: weights are [height, width, in_channels, out_channels]
-            print("kernel", kernels.shape)
+            print("kernel", rgb_kernels.shape)
             # reshape initial Convolution Kernel from 3 channels to IMG_CHANNELS through copying (r,g,b,r,g,b,r,g,...)
             # this is slightly clunky, but until we have a better VGG model for multiband this will do
-            kernels = np.concatenate(([kernels] * IMG_CHANNELS), axis=2)[:, :, :IMG_CHANNELS, :]
+            # rgb_kernels = np.concatenate(([rgb_kernels] * IMG_CHANNELS), axis=2)[:, :, :IMG_CHANNELS, :]
+            new_shape = list(rgb_kernels.shape)
+            new_shape[2] = 8
+            kernels = np.zeros(new_shape)
+            kernels[:, :, 0, :] = rgb_kernels[:, :, 0, :]
+            kernels[:, :, 1, :] = rgb_kernels[:, :, 0, :]
+            kernels[:, :, 2, :] = rgb_kernels[:, :, 1, :]
+            kernels[:, :, 3, :] = rgb_kernels[:, :, 1, :]
+            kernels[:, :, 4, :] = rgb_kernels[:, :, 2, :]
+            kernels[:, :, 5, :] = rgb_kernels[:, :, 2, :]
+            kernels[:, :, 6, :] = rgb_kernels[:, :, 2, :]
+            kernels[:, :, 7, :] = rgb_kernels[:, :, 2, :]
+
             print("kernel", kernels.shape)
             kernels = extract_var(np.transpose(kernels, (1, 0, 2, 3)), var_name=name + "_w")
             bias = extract_var(bias.reshape(-1), var_name=name + "_b")
