@@ -1,22 +1,21 @@
 from __future__ import print_function
 
+import gdal
 import datetime
-import pickle
+import os
 import random
 import sys
 import tarfile
 import zipfile
 from glob import glob
+from os.path import join, splitext, exists
 
-import os
 import numpy as np
 import requests
 import scipy.io
 import tensorflow as tf
-from os.path import join, splitext, exists
 from scipy.misc import imread, imsave, imresize
 from tensorflow.python.platform import gfile
-
 
 FLAGS = tf.flags.FLAGS
 tf.flags.DEFINE_integer("batch_size", "2", "batch size for training")
@@ -26,14 +25,14 @@ tf.flags.DEFINE_float("learning_rate", "1e-4", "Learning rate for Adam Optimizer
 tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
 tf.flags.DEFINE_bool('debug', "True", "Debug mode: True/ False")
 tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
-tf.flags.DEFINE_integer('channels', "3", "number of channels in image")
+tf.flags.DEFINE_integer('channels', "8", "number of channels in image")
 
 DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
 
 MAX_ITERATION = int(1e5 + 1)
 NUM_OF_CLASSES = 2
-IMAGE_SIZE = 1000
+IMAGE_SIZE = 100
 IMG_CHANNELS = FLAGS.channels
 
 ANNOTATIONS = 'masks'  # "annotations"
@@ -88,8 +87,8 @@ def bb(shape, name=None):
 def conv2d(x, w, bias):
     return tf.nn.bias_add(tf.nn.conv2d(x, w, strides=[1, 1, 1, 1], padding="SAME"), bias)
 
-def download_ade_date(data_dir):
 
+def download_ade_date(data_dir):
     filename, file_path = gen_file_path(DATA_URL, data_dir)
     if not exists(file_path):
         os.makedirs(data_dir, exist_ok=True)
@@ -100,37 +99,29 @@ def download_ade_date(data_dir):
     scene_parsing_folder = splitext(DATA_URL.split("/")[-1])[0]
     return join(data_dir, scene_parsing_folder)
 
-def read_dataset(data_dir, do_download=False):
-    pickle_filepath = join(data_dir, "dataset.pickle")
 
-    if exists(pickle_filepath):
-        with open(pickle_filepath, 'rb') as f:
-            result = pickle.load(f)
-            return result['training'], result['validation']
-    else:
-        if do_download:
-            data_dir = download_ade_date(data_dir)
-        result = create_image_lists(data_dir)
-        with open(pickle_filepath, 'wb') as f:
-            pickle.dump(result, f, pickle.HIGHEST_PROTOCOL)
-        return result['training'], result['validation']
-
-def create_image_lists(image_dir):
+def read_dataset(image_dir):
+    ext = 'png'
     if not gfile.Exists(image_dir):
         print("Image directory '" + image_dir + "' not found.")
         return None
     image_list = {'training': [], 'validation': []}
 
     for directory in image_list:
-        file_list = glob(join(image_dir, directory, IMAGES, '*.png'))
+        if gfile.Exists(join(image_dir, directory + '.txt')):
+            with open(join(image_dir, directory + '.txt')) as f:
+                file_list = f.read().split()
+        else:
+            file_list = glob(join(image_dir, directory, IMAGES, '*.{}'.format(ext)))
 
         if not file_list:
             print('No files found')
         else:
             for f in file_list:
                 filename = splitext(f.split("/")[-1])[0]
-                annotation_file = join(image_dir, directory, ANNOTATIONS, filename + '.png')
+                annotation_file = join(image_dir, directory, ANNOTATIONS, filename + '.' + ext)
                 if exists(annotation_file):
+                    r = Record(f, annotation_file)
                     record = {'image': f, 'annotation': annotation_file, 'filename': filename}
                     image_list[directory].append(record)
                 else:
@@ -139,12 +130,15 @@ def create_image_lists(image_dir):
         random.shuffle(image_list[directory])
         print('No. of %s files: %d' % (directory, (len(image_list[directory]))))
 
-    return image_list
+        return image_list['training'], image_list['validation']
+
 
 class Record:
-    def __init__(self, image, annotation):
+    def __init__(self, image, mask):
+        print(image, mask)
         self.image = image
-        self.annotation = annotation
+        self.mask = mask
+
 
 class BatchDataset:
     files = []
@@ -154,22 +148,50 @@ class BatchDataset:
     batch_offset = 0
     epochs_completed = 0
 
-    def __init__(self, records_list, resize, size):
+    def __init__(self, directory, ext, resize, size, mask_ext='png'):
         """
         Initialize a generic file reader with batching for list of files
-        :param records_list: list of file records to read -
+        :param mask_ext:
+        :param ext:
+        :param directory:
         sample record: {'image': f, 'annotation': annotation_file, 'filename': filename}
         Available options:
         resize = True/ False
         resize_size = #size of output image - does bilinear resize
         color=True/False
         """
+        records = []
+        if gfile.Exists(directory + '.txt'):
+            with open(directory + '.txt') as f:
+                file_list = f.read().split()
+        else:
+            file_list = glob(join(directory, IMAGES, '*.{}'.format(ext)))
+
+        if not file_list:
+            print('No files found')
+            raise FileNotFoundError()
+        else:
+            for f in file_list:
+                filename = splitext(f.split("/")[-1])[0]
+                mask_file = join(directory, ANNOTATIONS, filename + '.' + mask_ext)
+                if exists(mask_file):
+                    records.append(Record(f, mask_file))
+                else:
+                    print("Annotation file not found for %s - Skipping" % filename)
+
+        random.shuffle(records)
+        print('No. of %s files: %d' % (directory, (len(records))))
+
         self.resize = resize
         self.size = size
         print("Initializing Batch Dataset Reader...")
-        self.images = np.array([self.transform(imread(record['image'])) for record in records_list])
+        # todo TIF reading and manipulation
+        if ext == 'tif':
+            self.images = np.array([self.transform_tif(record.image) for record in records])
+        else:
+            self.images = np.array([self.transform(imread(record.image)) for record in records])
         self.annotations = np.array(
-            [np.expand_dims(self.transform(imread(record['annotation']), True), axis=3) for record in records_list])
+            [np.expand_dims(self.transform_mask(imread(record.mask)), axis=3) for record in records])
         self.batch_offset = 0
         print(self.images.shape)
         print(self.annotations.shape)
@@ -181,11 +203,22 @@ class BatchDataset:
         if not mask and len(image.shape) < 3:  # make sure images are of shape(h,w,3)
             image = np.array([image] * IMG_CHANNELS)
         elif not mask and image.shape[-1] < IMG_CHANNELS:  # make sure images are of shape(h,w,3)
-            image = np.dstack([image] * (1+IMG_CHANNELS//image.shape[-1]))[:, :, :IMG_CHANNELS]
+            image = np.dstack([image] * (1 + IMG_CHANNELS // image.shape[-1]))[:, :, :IMG_CHANNELS]
 
         if mask and image.shape[-1] > 1:
             # image = np.dot(image[..., :3], [0.299/128, 0.587/128, 0.114/128])
             image = (image.sum(axis=-1) > 0).astype(np.int)
+
+        return np.array(image)
+
+    def transform_mask(self, image):
+        if self.resize:
+            image = np.array(imresize(image, [self.size, self.size], interp='nearest'))
+
+        if len(image.shape) > 2 and image.shape[-1] > 1:
+            # image = np.dot(image[..., :3], [0.299/128, 0.587/128, 0.114/128])
+            image = (image.sum(axis=-1) > 0).astype(np.int)
+        image = (image > 0).astype(np.int)
 
         return np.array(image)
 
@@ -212,15 +245,24 @@ class BatchDataset:
         indexes = np.random.randint(0, self.images.shape[0], size=[batch_size]).tolist()
         return self.images[indexes], self.annotations[indexes]
 
+    def transform_tif(self, image):
+        i = gdal.Open(image, gdal.GA_ReadOnly).ReadAsArray()
+        if self.resize:
+            new_image = []
+            for layer in i:
+                new_layer = np.array(imresize(layer, [self.size, self.size], interp='nearest'))
+                new_image.append(new_layer)
+            i = np.array(new_image).transpose([1, 2, 0])
+        return i
 
-def vgg_net(weights, image):
-    print("VGGGG")
 
+def vgg_net(weights, image, mean):
     def extract_var(w, var_name, trainable=True):
         return tf.get_variable(name=var_name,
                                initializer=(tf.constant_initializer(w)),
                                shape=w.shape,
                                trainable=trainable)
+
     layers = (
         'conv1_1', 'relu1_1', 'conv1_2', 'relu1_2', 'pool1',
 
@@ -237,7 +279,7 @@ def vgg_net(weights, image):
     )
 
     net = {}
-    current = image
+    current_layer = image  # - mean
     for i, name in enumerate(layers):
         kind = name[:4]
         if i == 0:
@@ -245,27 +287,29 @@ def vgg_net(weights, image):
             # mat-convnet: weights are [width, height, in_channels, out_channels]
             # tensorflow: weights are [height, width, in_channels, out_channels]
             print("kernel", kernels.shape)
-            kernels = np.concatenate([kernels, kernels], axis=2)
+            # reshape initial Convolution Kernel from 3 channels to IMG_CHANNELS through copying (r,g,b,r,g,b,r,g,...)
+            # this is slightly clunky, but until we have a better VGG model for multiband this will do
+            kernels = np.concatenate(([kernels] * IMG_CHANNELS), axis=2)[:, :, :IMG_CHANNELS, :]
             print("kernel", kernels.shape)
             kernels = extract_var(np.transpose(kernels, (1, 0, 2, 3)), var_name=name + "_w")
             bias = extract_var(bias.reshape(-1), var_name=name + "_b")
-            current = conv2d(current, kernels, bias)
+            current_layer = conv2d(current_layer, kernels, bias)
         elif kind == 'conv':
             kernels, bias = weights[i][0][0][0][0]
             # mat-convnet: weights are [width, height, in_channels, out_channels]
             # tensorflow: weights are [height, width, in_channels, out_channels]
             kernels = extract_var(np.transpose(kernels, (1, 0, 2, 3)), var_name=name + "_w")
             bias = extract_var(bias.reshape(-1), var_name=name + "_b")
-            current = conv2d(current, kernels, bias)
+            current_layer = conv2d(current_layer, kernels, bias)
         elif kind == 'relu':
-            current = tf.nn.relu(current, name=name)
+            current_layer = tf.nn.relu(current_layer, name=name)
             if FLAGS.debug:
                 # utils.add_activation_summary(current)
-                tf.summary.histogram(current.op.name + "/activation", current)
-                tf.summary.scalar(current.op.name + "/sparsity", tf.nn.zero_fraction(current))
+                tf.summary.histogram(current_layer.op.name + "/activation", current_layer)
+                tf.summary.scalar(current_layer.op.name + "/sparsity", tf.nn.zero_fraction(current_layer))
         elif kind == 'pool':
-            current = tf.nn.avg_pool(current, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
-        net[name] = current
+            current_layer = tf.nn.avg_pool(current_layer, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
+        net[name] = current_layer
 
     return net
 
@@ -297,7 +341,7 @@ def inference(image, keep_prob):
     weights = np.squeeze(model_data['layers'])
 
     with tf.variable_scope("inference"):
-        image_net = vgg_net(weights, image - mean_pixel)
+        image_net = vgg_net(weights, image, mean_pixel)
         conv_final_layer = image_net["conv5_3"]
 
         pool5 = tf.nn.max_pool(conv_final_layer, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
@@ -371,13 +415,14 @@ def train_optimization(loss_val, var_list):
 def main(argv=None):
     print(argv)
 
+    print("Setting up dataset reader")
+    validation_dataset = BatchDataset(FLAGS.data_dir, 'tif', True, IMAGE_SIZE)
+
     print("Setting up image reader...")
-    train_records, valid_records = read_dataset(FLAGS.data_dir)
-    print(len(train_records))
-    print(len(valid_records))
 
     keep_probability = tf.placeholder(tf.float32, name="keep_probability")
-    image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, IMG_CHANNELS], name="input_image")
+    image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, IMG_CHANNELS],
+                                       name="input_image")
     annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
 
     pred_annotation, logits = inference(image_placeholder, keep_probability)
@@ -389,18 +434,20 @@ def main(argv=None):
             logits=logits, labels=tf.squeeze(annotation, squeeze_dims=[3]), name="entropy")))
     tf.summary.scalar("entropy", loss)
 
-    trainable_var = tf.trainable_variables()
     if FLAGS.debug:
-        for var in trainable_var:
+        for var in tf.trainable_variables():
             # utils.add_to_regularization_and_summary(var)
             tf.summary.histogram(var.op.name, var)
             tf.add_to_collection("reg_loss", tf.nn.l2_loss(var))
-    train_optimizer = train_optimization(loss, trainable_var)
+    optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
+    grads = optimizer.compute_gradients(loss, var_list=(tf.trainable_variables()))
+    if FLAGS.debug:
+        for grad, var in grads:
+            if grad is not None:
+                tf.summary.histogram(var.op.name + "/gradient", grad)
+    train_optimizer = optimizer.apply_gradients(grads)
 
     summary_op = tf.summary.merge_all()
-
-    print("Setting up dataset reader")
-    validation_dataset = BatchDataset(valid_records, True, IMAGE_SIZE)
 
     sess = tf.Session()
 
@@ -415,7 +462,7 @@ def main(argv=None):
         print("Model restored...")
 
     if FLAGS.mode == "train":
-        train_dataset = BatchDataset(train_records,  True, IMAGE_SIZE)
+        train_dataset = BatchDataset(FLAGS.data_dir, 'tif', True, IMAGE_SIZE)
         for itr in range(MAX_ITERATION):
             train_images, train_annotations = train_dataset.next_batch(FLAGS.batch_size)
             feed_dict = {image_placeholder: train_images, annotation: train_annotations, keep_probability: 0.85}
@@ -452,4 +499,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     tf.app.run()
-
