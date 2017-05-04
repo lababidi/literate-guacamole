@@ -20,7 +20,8 @@ from tensorflow.python.platform import gfile
 FLAGS = tf.flags.FLAGS
 tf.flags.DEFINE_integer("batch_size", "2", "batch size for training")
 tf.flags.DEFINE_string("logs_dir", "logs/", "path to logs directory")
-tf.flags.DEFINE_string("data_dir", "Data_zoo/MIT_SceneParsing/", "path to dataset")
+tf.flags.DEFINE_string("train_dir", "Data_zoo/MIT_SceneParsing/", "path to dataset")
+tf.flags.DEFINE_string("val_dir", "Data_zoo/MIT_SceneParsing/", "path to dataset")
 tf.flags.DEFINE_float("learning_rate", "1e-4", "Learning rate for Adam Optimizer")
 tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
 tf.flags.DEFINE_bool('debug', "True", "Debug mode: True/ False")
@@ -429,7 +430,7 @@ def main(argv=None):
     print(argv)
 
     print("Setting up dataset reader")
-    validation_dataset = BatchDataset(FLAGS.data_dir, 'tif', True, IMAGE_SIZE)
+    validation_dataset = BatchDataset(FLAGS.val_dir, 'tif', True, IMAGE_SIZE)
 
     print("Setting up image reader...")
 
@@ -475,7 +476,7 @@ def main(argv=None):
         print("Model restored...")
 
     if FLAGS.mode == "train":
-        train_dataset = BatchDataset(FLAGS.data_dir, 'tif', True, IMAGE_SIZE)
+        train_dataset = BatchDataset(FLAGS.train_dir, 'tif', True, IMAGE_SIZE)
         for itr in range(MAX_ITERATION):
             train_images, train_annotations = train_dataset.next_batch(FLAGS.batch_size)
             feed_dict = {image_placeholder: train_images, annotation: train_annotations, keep_probability: 0.85}
