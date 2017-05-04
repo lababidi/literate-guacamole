@@ -180,6 +180,7 @@ class BatchDataset:
                     print("Annotation file not found for %s - Skipping" % filename)
 
         random.shuffle(records)
+        self.records = records
         print('No. of %s files: %d' % (directory, (len(records))))
 
         self.resize = resize
@@ -243,7 +244,7 @@ class BatchDataset:
 
     def get_random_batch(self, batch_size):
         indexes = np.random.randint(0, self.images.shape[0], size=[batch_size]).tolist()
-        return self.images[indexes], self.annotations[indexes]
+        return self.images[indexes], self.annotations[indexes], [self.records[index] for index in indexes]
 
     def transform_tif(self, image):
         i = gdal.Open(image, gdal.GA_ReadOnly).ReadAsArray()
@@ -411,7 +412,7 @@ def inference(image, keep_prob):
 
         annotation_pred = tf.argmax(conv_t3, dimension=3, name="prediction")
 
-    return tf.expand_dims(annotation_pred, dim=3), conv_t3
+    return tf.expand_dims(annotation_pred, dim=3), conv_t3, image_net
 
 
 def train_optimization(loss_val, var_list):
@@ -437,7 +438,7 @@ def main(argv=None):
                                        name="input_image")
     annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
 
-    pred_annotation, logits = inference(image_placeholder, keep_probability)
+    pred_annotation, logits, image_net = inference(image_placeholder, keep_probability)
     # tf.summary.image("input_image", image_placeholder, max_outputs=2)
     tf.summary.image("ground_truth", tf.cast(annotation, tf.uint8), max_outputs=2)
     tf.summary.image("pred_annotation", tf.cast(pred_annotation, tf.uint8), max_outputs=2)
@@ -496,14 +497,25 @@ def main(argv=None):
                 saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
     elif FLAGS.mode == "visualize":
-        valid_images, valid_annotations = validation_dataset.get_random_batch(FLAGS.batch_size)
+        # with open('conv1.dat', 'w') as f:
+        #     f.write(image_net['conv1_1'].eval(session=sess))
+        sess.as_default()
+        valid_images, valid_annotations, recs = validation_dataset.get_random_batch(FLAGS.batch_size)
+        np.save('conv1_1w',(sess.run(tf.trainable_variables()[0])))
+        np.save('conv1_1b',(sess.run(tf.trainable_variables()[1])))
+        np.save('conv1_2w',(sess.run(tf.trainable_variables()[3])))
+        np.save('conv1_2b',(sess.run(tf.trainable_variables()[4])))
+        np.save('conv1.out', sess.run(image_net['conv1_1'], feed_dict={image_placeholder: valid_images}).astype(np.float16))
         pred = sess.run(pred_annotation, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
                                                     keep_probability: 1.0})
         valid_annotations = np.squeeze(valid_annotations, axis=3)
         pred = np.squeeze(pred, axis=3)
 
         for itr in range(FLAGS.batch_size):
-            imsave(join(FLAGS.logs_dir, "inp_{}.png".format(itr)), valid_images[itr].astype(np.uint8))
+            # imsave(join(FLAGS.logs_dir, "inp_{}.png".format(itr)), valid_images[itr].astype(np.uint8))
+            with open(join(FLAGS.logs_dir,'inp_{}.txt'.format(itr)), 'w') as f:
+                f.write(recs[itr].image)
+                f.write(recs[itr].mask)
             imsave(join(FLAGS.logs_dir, "gt_{}.png".format(itr)), valid_annotations[itr].astype(np.uint8))
             imsave(join(FLAGS.logs_dir, "pred_{}.png".format(itr)), pred[itr].astype(np.uint8))
             print("Saved image: %d" % itr)
