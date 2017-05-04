@@ -65,7 +65,7 @@ def download(path, url):
             if chunk:
                 f.write(chunk)
                 blocks += 1
-                sys.stdout.write('\r>> Downloading %.1f%%'.format(100.0 * blocks / total_blocks))
+                sys.stdout.write('\r>> Downloading {}'.format(100.0 * blocks / total_blocks))
                 sys.stdout.flush()
         return os.stat(path).st_size
 
