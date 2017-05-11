@@ -1,6 +1,5 @@
 from __future__ import print_function
 
-import gdal
 import datetime
 import os
 import random
@@ -10,6 +9,7 @@ import zipfile
 from glob import glob
 from os.path import join, splitext, exists
 
+import gdal
 import numpy as np
 import requests
 import scipy.io
@@ -498,6 +498,7 @@ def main(argv=None):
                 print("Step: %d, Train_loss:%g" % (itr, train_loss))
                 summary_writer.add_summary(summary_str, itr)
                 saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
+                tf.train.export_meta_graph('fcn.tff')
 
             if itr % 5 == 0:
                 valid_images, valid_annotations = validation_dataset.next_batch(FLAGS.batch_size)
@@ -505,31 +506,38 @@ def main(argv=None):
                                                        annotation: valid_annotations,
                                                        keep_probability: 1.0})
                 print("%s ---> Validation_loss: %g" % (datetime.datetime.now(), valid_loss))
-                saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
+                # saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
     elif FLAGS.mode == "visualize":
         # with open('conv1.dat', 'w') as f:
         #     f.write(image_net['conv1_1'].eval(session=sess))
         sess.as_default()
         valid_images, valid_annotations, recs = validation_dataset.get_random_batch(FLAGS.batch_size)
-        np.save('conv1_1w',(sess.run(tf.trainable_variables()[0])))
-        np.save('conv1_1b',(sess.run(tf.trainable_variables()[1])))
-        np.save('conv1_2w',(sess.run(tf.trainable_variables()[3])))
-        np.save('conv1_2b',(sess.run(tf.trainable_variables()[4])))
-        np.save('conv1.out', sess.run(image_net['conv1_1'], feed_dict={image_placeholder: valid_images}).astype(np.float16))
+        np.save('conv1_1w', (sess.run(tf.trainable_variables()[0])))
+        np.save('conv1_1b', (sess.run(tf.trainable_variables()[1])))
+        np.save('conv1_2w', (sess.run(tf.trainable_variables()[3])))
+        np.save('conv1_2b', (sess.run(tf.trainable_variables()[4])))
+        np.save('conv1.out',
+                sess.run(image_net['conv1_1'], feed_dict={image_placeholder: valid_images}).astype(np.float16))
+        time_now = datetime.datetime.now()
         pred = sess.run(pred_annotation, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
                                                     keep_probability: 1.0})
+        print(datetime.datetime.now() - time_now)
         valid_annotations = np.squeeze(valid_annotations, axis=3)
         pred = np.squeeze(pred, axis=3)
 
         for itr in range(FLAGS.batch_size):
             # imsave(join(FLAGS.logs_dir, "inp_{}.png".format(itr)), valid_images[itr].astype(np.uint8))
-            with open(join(FLAGS.logs_dir,'inp_{}.txt'.format(itr)), 'w') as f:
+            with open(join(FLAGS.logs_dir, 'inp_{}.txt'.format(itr)), 'w') as f:
                 f.write(recs[itr].image)
                 f.write(recs[itr].mask)
             imsave(join(FLAGS.logs_dir, "gt_{}.png".format(itr)), valid_annotations[itr].astype(np.uint8))
             imsave(join(FLAGS.logs_dir, "pred_{}.png".format(itr)), pred[itr].astype(np.uint8))
             print("Saved image: %d" % itr)
+
+        tf.train.write_graph(sess.graph_def, 'models/', 'graph.pb', as_text=False)
+        tf.train.write_graph(sess.graph_def, 'models/', 'graph.pbtx')
+        tf.train.export_meta_graph('fcn.tf', collection_list=['pred_annotation', 'loss', 'logits'])
 
 
 if __name__ == "__main__":
