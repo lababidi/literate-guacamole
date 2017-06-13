@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+import gdal
 import datetime
 import os
 import random
@@ -9,13 +10,14 @@ import zipfile
 from glob import glob
 from os.path import join, splitext, exists
 
-import gdal
 import numpy as np
 import requests
 import scipy.io
 import tensorflow as tf
 from scipy.misc import imread, imsave, imresize
 from tensorflow.python.platform import gfile
+
+import rasterio
 
 FLAGS = tf.flags.FLAGS
 tf.flags.DEFINE_integer("batch_size", "2", "batch size for training")
@@ -171,7 +173,7 @@ class BatchDataset:
 
         if not file_list:
             print('No files found')
-            raise FileNotFoundError()
+            raise FileNotFoundError(join(directory, IMAGES, '*.{}'.format(ext)))
         else:
             for f in file_list:
                 filename = splitext(f.split("/")[-1])[0]
@@ -249,7 +251,10 @@ class BatchDataset:
         return self.images[indexes], self.annotations[indexes], [self.records[index] for index in indexes]
 
     def transform_tif(self, image):
-        i = gdal.Open(image, gdal.GA_ReadOnly).ReadAsArray()
+        with rasterio.open(image) as f:
+            i =np.array(f.read())
+
+        # i = gdal.Open(image, gdal.GA_ReadOnly).ReadAsArray()
         if self.resize:
             new_image = []
             for layer in i:
@@ -293,17 +298,20 @@ def vgg_net(weights, image, mean):
             # reshape initial Convolution Kernel from 3 channels to IMG_CHANNELS through copying (r,g,b,r,g,b,r,g,...)
             # this is slightly clunky, but until we have a better VGG model for multiband this will do
             # rgb_kernels = np.concatenate(([rgb_kernels] * IMG_CHANNELS), axis=2)[:, :, :IMG_CHANNELS, :]
-            new_shape = list(rgb_kernels.shape)
-            new_shape[2] = 8
-            kernels = np.zeros(new_shape)
-            kernels[:, :, 0, :] = rgb_kernels[:, :, 0, :]
-            kernels[:, :, 1, :] = rgb_kernels[:, :, 0, :]
-            kernels[:, :, 2, :] = rgb_kernels[:, :, 1, :]
-            kernels[:, :, 3, :] = rgb_kernels[:, :, 1, :]
-            kernels[:, :, 4, :] = rgb_kernels[:, :, 2, :]
-            kernels[:, :, 5, :] = rgb_kernels[:, :, 2, :]
-            kernels[:, :, 6, :] = rgb_kernels[:, :, 2, :]
-            kernels[:, :, 7, :] = rgb_kernels[:, :, 2, :]
+            if IMG_CHANNELS == 8:
+                new_shape = list(rgb_kernels.shape)
+                new_shape[2] = 8
+                kernels = np.zeros(new_shape)
+                kernels[:, :, 0, :] = rgb_kernels[:, :, 0, :]
+                kernels[:, :, 1, :] = rgb_kernels[:, :, 0, :]
+                kernels[:, :, 2, :] = rgb_kernels[:, :, 1, :]
+                kernels[:, :, 3, :] = rgb_kernels[:, :, 1, :]
+                kernels[:, :, 4, :] = rgb_kernels[:, :, 2, :]
+                kernels[:, :, 5, :] = rgb_kernels[:, :, 2, :]
+                kernels[:, :, 6, :] = rgb_kernels[:, :, 2, :]
+                kernels[:, :, 7, :] = rgb_kernels[:, :, 2, :]
+            else:
+                kernels = rgb_kernels
 
             print("kernel", kernels.shape)
             kernels = extract_var(np.transpose(kernels, (1, 0, 2, 3)), var_name=name + "_w")
@@ -528,11 +536,11 @@ def main(argv=None):
 
         for itr in range(FLAGS.batch_size):
             # imsave(join(FLAGS.logs_dir, "inp_{}.png".format(itr)), valid_images[itr].astype(np.uint8))
-            with open(join(FLAGS.logs_dir, 'inp_{}.txt'.format(itr)), 'w') as f:
+            with open(join(FLAGS.data_dir, 'inp_{}.txt'.format(itr)), 'w') as f:
                 f.write(recs[itr].image)
                 f.write(recs[itr].mask)
-            imsave(join(FLAGS.logs_dir, "gt_{}.png".format(itr)), valid_annotations[itr].astype(np.uint8))
-            imsave(join(FLAGS.logs_dir, "pred_{}.png".format(itr)), pred[itr].astype(np.uint8))
+            imsave(join(FLAGS.data_dir, "gt_{}.png".format(itr)), valid_annotations[itr].astype(np.uint8))
+            imsave(join(FLAGS.data_dir, "pred_{}.png".format(itr)), pred[itr].astype(np.uint8))
             print("Saved image: %d" % itr)
 
         tf.train.write_graph(sess.graph_def, 'models/', 'graph.pb', as_text=False)
