@@ -30,6 +30,7 @@ tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
 tf.flags.DEFINE_bool('debug', "True", "Debug mode: True/ False")
 tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
 tf.flags.DEFINE_integer('channels', "8", "number of channels in image")
+tf.flags.DEFINE_integer('ext', "tif", "image extension (Not masks)")
 
 DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
@@ -448,7 +449,7 @@ def main(argv=None):
         train_dir = FLAGS.train_dir
         train_batch = val_batch = None
 
-    validation_dataset = BatchDataset(val_dir, 'tif', True, IMAGE_SIZE, filename=val_batch)
+    validation_dataset = BatchDataset(val_dir, FLAGS.ext, True, IMAGE_SIZE, filename=val_batch)
 
     print("Setting up image reader...")
 
@@ -494,7 +495,7 @@ def main(argv=None):
         print("Model restored...")
 
     if FLAGS.mode == "train":
-        train_dataset = BatchDataset(train_dir, 'tif', True, IMAGE_SIZE, filename=train_batch)
+        train_dataset = BatchDataset(train_dir, FLAGS.ext, True, IMAGE_SIZE, filename=train_batch)
         for itr in range(MAX_ITERATION):
             train_images, train_annotations = train_dataset.next_batch(FLAGS.batch_size)
             feed_dict = {image_placeholder: train_images, annotation: train_annotations, keep_probability: 0.85}
