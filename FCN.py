@@ -30,7 +30,7 @@ tf.flags.DEFINE_string("model_dir", "Model_zoo/", "Path to vgg model mat")
 tf.flags.DEFINE_bool('debug', "True", "Debug mode: True/ False")
 tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
 tf.flags.DEFINE_integer('channels', "8", "number of channels in image")
-tf.flags.DEFINE_integer('ext', "tif", "image extension (Not masks)")
+tf.flags.DEFINE_string('ext', "tif", "image extension (Not masks)")
 
 DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
