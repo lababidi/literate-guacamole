@@ -107,39 +107,6 @@ def download_ade_date(data_dir):
     return join(data_dir, scene_parsing_folder)
 
 
-def read_dataset(image_dir):
-    ext = 'png'
-    if not gfile.Exists(image_dir):
-        print("Image directory '" + image_dir + "' not found.")
-        return None
-    image_list = {'training': [], 'validation': []}
-
-    for directory in image_list:
-        if gfile.Exists(join(image_dir, directory + '.txt')):
-            with open(join(image_dir, directory + '.txt')) as f:
-                file_list = f.read().split()
-        else:
-            file_list = glob(join(image_dir, directory, IMAGES, '*.{}'.format(ext)))
-
-        if not file_list:
-            print('No files found')
-        else:
-            for f in file_list:
-                filename = splitext(f.split("/")[-1])[0]
-                annotation_file = join(image_dir, directory, ANNOTATIONS, filename + '.' + ext)
-                if exists(annotation_file):
-                    r = Record(f, annotation_file)
-                    record = {'image': f, 'annotation': annotation_file, 'filename': filename}
-                    image_list[directory].append(record)
-                else:
-                    print("Annotation file not found for %s - Skipping" % filename)
-
-        random.shuffle(image_list[directory])
-        print('No. of %s files: %d' % (directory, (len(image_list[directory]))))
-
-        return image_list['training'], image_list['validation']
-
-
 class Record:
     def __init__(self, image, mask):
         print(image, mask)
@@ -255,7 +222,7 @@ class BatchDataset:
 
     def transform_tif(self, image):
         with rasterio.open(image) as f:
-            i =np.array(f.read())
+            i = np.array(f.read())
 
         # i = gdal.Open(image, gdal.GA_ReadOnly).ReadAsArray()
         if self.resize:
