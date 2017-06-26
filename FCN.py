@@ -33,6 +33,7 @@ tf.flags.DEFINE_string('mode', "train", "Mode train/ test/ visualize")
 tf.flags.DEFINE_integer('channels', "8", "number of channels in image")
 tf.flags.DEFINE_integer('size', "768", "image size in pixels to resize to")
 tf.flags.DEFINE_string('ext', "tif", "image extension (Not masks)")
+tf.flags.DEFINE_string('model', "", "Model to use")
 
 DATA_URL = 'http://sceneparsing.csail.mit.edu/data/ADEChallengeData2016.zip'
 MODEL_URL = 'http://www.vlfeat.org/matconvnet/models/beta16/imagenet-vgg-verydeep-19.mat'
@@ -455,48 +456,50 @@ def main(argv=None):
 
     print("Setting up image reader...")
 
-    keep_probability = tf.placeholder(tf.float32, name="keep_probability")
-    image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, IMG_CHANNELS],
-                                       name="input_image")
-    annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
-
-    pred_annotation, logits, image_net = inference(image_placeholder, keep_probability)
-    # tf.summary.image("input_image", image_placeholder, max_outputs=2)
-    tf.summary.image("ground_truth", tf.cast(annotation, tf.uint8), max_outputs=2)
-    tf.summary.image("pred_annotation", tf.cast(pred_annotation, tf.uint8), max_outputs=2)
-    loss = tf.reduce_mean((
-        tf.nn.sparse_softmax_cross_entropy_with_logits(
-            logits=logits, labels=tf.squeeze(annotation, squeeze_dims=[3]), name="entropy")))
-    tf.summary.scalar("entropy", loss)
-
-    if FLAGS.debug:
-        for var in tf.trainable_variables():
-            # utils.add_to_regularization_and_summary(var)
-            tf.summary.histogram(var.op.name, var)
-            tf.add_to_collection("reg_loss", tf.nn.l2_loss(var))
-    optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
-    grads = optimizer.compute_gradients(loss, var_list=(tf.trainable_variables()))
-    if FLAGS.debug:
-        for grad, var in grads:
-            if grad is not None:
-                tf.summary.histogram(var.op.name + "/gradient", grad)
-    train_optimizer = optimizer.apply_gradients(grads)
-
-    summary_op = tf.summary.merge_all()
-
-    sess = tf.Session()
-
-    print("Setting up Saver...")
-    saver = tf.train.Saver()
-    summary_writer = tf.summary.FileWriter(FLAGS.logs_dir, sess.graph)
-
-    sess.run(tf.global_variables_initializer())
-    ckpt = tf.train.get_checkpoint_state(FLAGS.logs_dir)
-    if ckpt and ckpt.model_checkpoint_path:
-        saver.restore(sess, ckpt.model_checkpoint_path)
-        print("Model restored...")
-
     if FLAGS.mode == "train":
+        keep_probability = tf.placeholder(tf.float32, name="keep_probability")
+        image_placeholder = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, IMG_CHANNELS],
+                                           name="input_image")
+        annotation = tf.placeholder(tf.int32, shape=[None, IMAGE_SIZE, IMAGE_SIZE, 1], name="annotation")
+
+        pred_annotation, logits, image_net = inference(image_placeholder, keep_probability)
+        # tf.summary.image("input_image", image_placeholder, max_outputs=2)
+        tf.summary.image("ground_truth", tf.cast(annotation, tf.uint8), max_outputs=2)
+        tf.summary.image("pred_annotation", tf.cast(pred_annotation, tf.uint8), max_outputs=2)
+        loss = tf.reduce_mean((
+            tf.nn.sparse_softmax_cross_entropy_with_logits(
+                logits=logits, labels=tf.squeeze(annotation, squeeze_dims=[3]), name="entropy")))
+        tf.summary.scalar("entropy", loss)
+
+        if FLAGS.debug:
+            for var in tf.trainable_variables():
+                # utils.add_to_regularization_and_summary(var)
+                tf.summary.histogram(var.op.name, var)
+                tf.add_to_collection("reg_loss", tf.nn.l2_loss(var))
+        optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
+        grads = optimizer.compute_gradients(loss, var_list=(tf.trainable_variables()))
+        if FLAGS.debug:
+            for grad, var in grads:
+                if grad is not None:
+                    tf.summary.histogram(var.op.name + "/gradient", grad)
+        train_optimizer = optimizer.apply_gradients(grads)
+
+        summary_op = tf.summary.merge_all()
+
+        sess = tf.Session()
+
+        print("Setting up Saver...")
+        saver = tf.train.Saver()
+        summary_writer = tf.summary.FileWriter(FLAGS.logs_dir, sess.graph)
+
+        sess.run(tf.global_variables_initializer())
+        ckpt = tf.train.get_checkpoint_state(FLAGS.logs_dir)
+        if ckpt and ckpt.model_checkpoint_path:
+            saver.restore(sess, ckpt.model_checkpoint_path)
+            print("Model restored...")
+        else:
+            print("Model NOT FOUND")
+
         train_dataset = BatchDataset(train_dir, FLAGS.ext, True, IMAGE_SIZE, filename=train_batch)
         for itr in range(MAX_ITERATION):
             train_images, train_annotations = train_dataset.next_batch(FLAGS.batch_size)
@@ -520,6 +523,9 @@ def main(argv=None):
                 # saver.save(sess, FLAGS.logs_dir + "model.ckpt", itr)
 
     elif FLAGS.mode == "visualize":
+        sess = tf.Session()
+        new_saver = tf.train.import_meta_graph(FLAGS.model + '.meta')
+        new_saver.restore(sess, FLAGS.model)
         # with open('conv1.dat', 'w') as f:
         #     f.write(image_net['conv1_1'].eval(session=sess))
         sess.as_default()
@@ -528,14 +534,16 @@ def main(argv=None):
         np.save('conv1_1b', (sess.run(tf.trainable_variables()[1])))
         np.save('conv1_2w', (sess.run(tf.trainable_variables()[3])))
         np.save('conv1_2b', (sess.run(tf.trainable_variables()[4])))
-        np.save('conv1.out',
-                sess.run(image_net['conv1_1'], feed_dict={image_placeholder: valid_images}).astype(np.float16))
+        #np.save('conv1.out',
+        #        sess.run(image_net['conv1_1'], feed_dict={image_placeholder: valid_images}).astype(np.float16))
         time_now = datetime.datetime.now()
-        pred = sess.run(pred_annotation, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
-                                                    keep_probability: 1.0})
+        pred = sess.run('inference/prediction:0', feed_dict={'input_image:0':valid_images,'keep_probability:0':1.0})
+        #pred = sess.run(pred_annotation, feed_dict={image_placeholder: valid_images, annotation: valid_annotations,
+        #                                            keep_probability: 1.0})
         print(datetime.datetime.now() - time_now)
         valid_annotations = np.squeeze(valid_annotations, axis=3)
-        pred = np.squeeze(pred, axis=3)
+        if len(pred.shape)>3:
+            pred = np.squeeze(pred, axis=3)
 
         for itr in range(FLAGS.batch_size):
             # imsave(join(FLAGS.logs_dir, "inp_{}.png".format(itr)), valid_images[itr].astype(np.uint8))
